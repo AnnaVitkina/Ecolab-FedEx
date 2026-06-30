@@ -304,5 +304,18 @@ def main(argv: list[str] | None = None) -> int:
         raise
 
 
+def _should_raise_system_exit() -> bool:
+    if _IN_COLAB:
+        return False
+    try:
+        from IPython import get_ipython
+
+        return get_ipython() is None
+    except ImportError:
+        return True
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _exit_code = main()
+    if _should_raise_system_exit():
+        raise SystemExit(_exit_code)
