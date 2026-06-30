@@ -219,6 +219,23 @@ def run_pipeline(
     )
 
 
+def _default_cli_argv() -> list[str]:
+    if _IN_COLAB:
+        return []
+    try:
+        from IPython import get_ipython
+
+        shell = get_ipython()
+        if shell is not None and shell.__class__.__name__ in (
+            "ZMQInteractiveShell",
+            "Shell",
+        ):
+            return []
+    except ImportError:
+        pass
+    return sys.argv[1:]
+
+
 def print_summary(result: PipelineOutputs) -> None:
     print("\n" + "=" * 40)
     print("Done!")
@@ -266,7 +283,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Skip zone chart text export",
     )
-    args = parser.parse_args(argv)
+    args = parser.parse_args(argv if argv is not None else _default_cli_argv())
 
     try:
         input_path = Path(args.input) if args.input else select_input_file(Path(args.input_dir))
