@@ -15,8 +15,9 @@ FILENAME_COUNTRY_RE = re.compile(r"International([A-Z]{2})", re.IGNORECASE)
 SERVICE_CODE_RULES: list[tuple[str, str]] = [
     ("Priority Express", "IPE"),
     ("Priority Freight", "IPF"),
-    ("Economy Freight", "IEF"),
+    # Regional Economy Freight before Economy Freight (substring overlap).
     ("Regional Economy Freight", "REF"),
+    ("Economy Freight", "IEF"),
     ("Deferred Freight", "FDF"),
     ("Regional Economy", "RE"),
     ("International Economy", "IE"),
@@ -95,21 +96,28 @@ def normalize_zone_country_name(country_label: str) -> str | None:
     return name
 
 
-POSTAL_ZONE_LABEL_RE = re.compile(r"^[A-Z]{2} Zone [A-Z0-9]+$")
+# Postal labels use country name (e.g. "France Zone S"), not service/direction.
+# Country-region labels look like "Export RE Zone S" / "Import IEF Zone M".
+COUNTRY_REGION_LABEL_RE = re.compile(
+    r"^(Export|Import) [A-Z]{2,3} Zone [A-Z0-9]+$"
+)
+POSTAL_ZONE_LABEL_RE = re.compile(
+    r"^(?!Export |Import ).+ Zone [A-Z0-9]+$"
+)
 
 
 def postal_zone_label(country_label: str, zone_letter: str) -> str:
+    """Build a postal-zone display label, e.g. 'France Zone S'."""
     parsed = parse_postal_entry(country_label)
     if not parsed or not zone_letter:
         return ""
-    iso = country_name_to_iso2(parsed[0])
-    return f"{iso} Zone {zone_letter}"
+    return f"{parsed[0]} Zone {zone_letter}"
 
 
 def postal_zone_labels(
     countries: list[dict[str, Any]], rate_code: str
 ) -> dict[str, str]:
-    """Map zone-chart postal rows to ISO Zone X labels (e.g. FR Zone S)."""
+    """Map zone-chart postal rows to 'Country Zone X' labels (e.g. France Zone S)."""
     result: dict[str, str] = {}
     for entry in countries:
         country_label = entry.get("country", "")
@@ -123,11 +131,16 @@ def postal_zone_labels(
 
 
 def is_postal_zone_region(region: str) -> bool:
-    return bool(POSTAL_ZONE_LABEL_RE.match(region.strip()))
+    text = region.strip()
+    if COUNTRY_REGION_LABEL_RE.match(text):
+        return False
+    return bool(POSTAL_ZONE_LABEL_RE.match(text))
 
 
 def zone_letter_from_postal_region(region: str) -> str | None:
-    match = re.match(r"^[A-Z]{2} Zone ([A-Z0-9]+)$", region.strip())
+    if not is_postal_zone_region(region):
+        return None
+    match = re.search(r" Zone ([A-Z0-9]+)$", region.strip())
     return match.group(1) if match else None
 
 
@@ -165,8 +178,13 @@ def transport_cost_title(cost_key: str) -> str:
 
 
 def iso_from_postal_zone_label(postal_zone: str) -> str:
-    match = re.match(r"^([A-Z]{2}) Zone ", postal_zone.strip())
-    return match.group(1) if match else ""
+    match = re.match(r"^(.+?) Zone [A-Z0-9]+$", postal_zone.strip())
+    if not match:
+        return ""
+    country = match.group(1)
+    if re.fullmatch(r"[A-Z]{2}", country):
+        return country
+    return country_name_to_iso2(country)
 
 
 def shipment_fields_for_region(
