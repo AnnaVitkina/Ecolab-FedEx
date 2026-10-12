@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from rate_metadata import (
@@ -109,29 +109,58 @@ def format_weight_label(
     return ""
 
 
-def open_ended_weight_labels(entries: list[dict[str, Any]]) -> dict[str, str]:
-    weighted: list[tuple[str, str]] = []
+# When a per-kg block is parsed alone (no companion bracket rows), use these
+# open-ended labels so Flat vs p/unit columns stay consistent with net rates.
+DEFAULT_OPEN_ENDED_LABEL: dict[str, str] = {
+    "package": ">70.5",
+    "package_regional_economy": ">70",
+}
+
+
+def open_ended_weight_labels(
+    entries: list[dict[str, Any]],
+    *,
+    cost_key: str = "",
+) -> dict[str, str]:
     open_ranges: list[str] = []
+    bounded_ranges: list[tuple[str, float, float]] = []
 
     for entry in entries:
         weight = (entry.get("weight") or "").strip()
-        if not weight:
+        if not weight or not WEIGHT_RANGE_RE.match(weight):
             continue
-        if WEIGHT_RANGE_RE.match(weight):
-            parts = re.split(r"\s*-\s*", weight)
-            upper = _parse_number(parts[1])
-            if upper >= 99999:
-                open_ranges.append(weight)
-            else:
-                weighted.append((weight, weight))
+        parts = re.split(r"\s*-\s*", weight)
+        lower = _parse_number(parts[0])
+        upper = _parse_number(parts[1])
+        if upper >= 99999:
+            open_ranges.append(weight)
         else:
-            weighted.append((weight, weight))
+            bounded_ranges.append((weight, lower, upper))
 
     replacements: dict[str, str] = {}
+
+    # Package Economy: dual per-kg bands → <9999 / >=9999
+    has_9999_band = any(abs(upper - 9999.0) < 0.01 for _, _, upper in bounded_ranges)
+    has_open_after_9999 = any(
+        _parse_number(re.split(r"\s*-\s*", w)[0]) >= 9999.0 for w in open_ranges
+    )
+    if cost_key == "package_economy" or (has_9999_band and has_open_after_9999):
+        for weight, _lower, upper in bounded_ranges:
+            if abs(upper - 9999.0) < 0.01:
+                replacements[weight] = "<9999"
+        for open_weight in open_ranges:
+            replacements[open_weight] = ">=9999"
+        if replacements:
+            return replacements
+
     if not open_ranges:
         return replacements
 
-    if len(entries) == 1 and len(open_ranges) == 1:
+    if len(open_ranges) == 1 and not bounded_ranges:
+        default_label = DEFAULT_OPEN_ENDED_LABEL.get(cost_key)
+        if default_label:
+            replacements[open_ranges[0]] = default_label
+            return replacements
         parts = re.split(r"\s*-\s*", open_ranges[0])
         lower = _parse_number(parts[0])
         if lower == int(lower):
@@ -140,22 +169,23 @@ def open_ended_weight_labels(entries: list[dict[str, Any]]) -> dict[str, str]:
             replacements[open_ranges[0]] = f">={lower}"
         return replacements
 
-    numeric_weights: list[tuple[float, str]] = []
+    numeric_weights: list[float] = []
     for entry in entries:
         weight = (entry.get("weight") or "").strip()
-        if not weight or not WEIGHT_RANGE_RE.match(weight):
-            if weight:
-                try:
-                    numeric_weights.append((_parse_number(weight), weight))
-                except ValueError:
-                    pass
+        if not weight:
             continue
-        parts = re.split(r"\s*-\s*", weight)
-        upper = _parse_number(parts[1])
-        if upper < 99999:
-            numeric_weights.append((upper, weight))
+        if WEIGHT_RANGE_RE.match(weight):
+            parts = re.split(r"\s*-\s*", weight)
+            upper = _parse_number(parts[1])
+            if upper < 99999:
+                numeric_weights.append(upper)
+        else:
+            try:
+                numeric_weights.append(_parse_number(weight))
+            except ValueError:
+                pass
 
-    last_numeric = max((value for value, _ in numeric_weights), default=None)
+    last_numeric = max(numeric_weights, default=None)
 
     for open_weight in open_ranges:
         parts = re.split(r"\s*-\s*", open_weight)
@@ -178,6 +208,9 @@ def weight_sort_key(label: str) -> tuple[int, float, str]:
         return (0, 0.0, label)
     if lower == "per kg":
         return (4, 99999.0, label)
+    match = re.match(r"<(\d+(?:\.\d+)?)", label)
+    if match:
+        return (3, float(match.group(1)) - 0.01, label)
     match = re.match(r">=(\d+(?:\.\d+)?)", label)
     if match:
         return (3, float(match.group(1)), label)
@@ -201,15 +234,43 @@ def pricing_label_for_group(
     return "Rate by: per shipment"
 
 
-def value_header_for_group(weight_labels: list[str]) -> str:
-    if len(weight_labels) == 1 and weight_labels[0].lower() == "flat":
+def _is_per_unit_weight_label(cost_key: str, weight_label: str) -> bool:
+    """Weight brackets are Flat; only designated open-ended bands are p/unit."""
+    label = weight_label.strip()
+    lower = label.lower()
+    if lower == "flat":
+        return False
+    if lower == "per kg":
+        return True
+
+    if cost_key == "package_economy":
+        return label in ("<9999", ">=9999")
+    if cost_key == "package":
+        return label == ">70.5" or lower.startswith(">")
+    if cost_key == "package_regional_economy":
+        return label == ">70" or lower.startswith(">")
+    if cost_key in ("pak", "envelope"):
+        return False
+    # Freight (and unknown) rates are per-unit / per kg.
+    return True
+
+
+def value_header_for_group(weight_labels: list[str], cost_key: str = "") -> str:
+    if not weight_labels:
         return "Flat"
+    if all(not _is_per_unit_weight_label(cost_key, label) for label in weight_labels):
+        return "Flat"
+    if all(_is_per_unit_weight_label(cost_key, label) for label in weight_labels):
+        return "p/unit"
     return "p/unit"
 
 
-def value_headers_for_labels(weight_labels: list[str]) -> list[str]:
+def value_headers_for_labels(
+    weight_labels: list[str], cost_key: str = ""
+) -> list[str]:
     return [
-        "Flat" if label.lower() == "flat" else "p/unit" for label in weight_labels
+        "p/unit" if _is_per_unit_weight_label(cost_key, label) else "Flat"
+        for label in weight_labels
     ]
 
 
@@ -299,6 +360,37 @@ def _row_sort_key(row: MatrixRow) -> tuple[Any, ...]:
     )
 
 
+def _row_direction(row: MatrixRow) -> str:
+    return "Export" if row.origin_country else "Import"
+
+
+def asymmetric_zone_row_keys(rows: list[MatrixRow]) -> set[str]:
+    """Row keys whose zone letter exists on only one of import/export for a service."""
+    zones_by_service: dict[str, dict[str, set[str]]] = defaultdict(
+        lambda: {"Export": set(), "Import": set()}
+    )
+    row_zones: list[tuple[str, str, str, str]] = []
+
+    for row in rows:
+        letter = _region_zone_letter(_row_primary_region(row))
+        if not letter:
+            continue
+        direction = _row_direction(row)
+        zones_by_service[row.service][direction].add(letter)
+        row_zones.append((row.row_key, row.service, direction, letter))
+
+    asymmetric: set[str] = set()
+    for row_key, service, direction, letter in row_zones:
+        export_zones = zones_by_service[service]["Export"]
+        import_zones = zones_by_service[service]["Import"]
+        if not export_zones or not import_zones:
+            continue
+        other = "Import" if direction == "Export" else "Export"
+        if letter not in zones_by_service[service][other]:
+            asymmetric.add(row_key)
+    return asymmetric
+
+
 def build_regions_for_block(
     block: dict[str, Any],
     zone_charts: list[dict[str, Any]],
@@ -377,7 +469,6 @@ def build_cost_groups_and_rows(
         if not entries:
             continue
 
-        open_ended = open_ended_weight_labels(entries)
         entries_by_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for entry in entries:
             rate_type = (entry.get("rate_type") or "package").lower()
@@ -387,6 +478,7 @@ def build_cost_groups_and_rows(
 
         for rate_type, type_entries in entries_by_type.items():
             cost_key = resolve_cost_key(block, rate_type)
+            open_ended = open_ended_weight_labels(type_entries, cost_key=cost_key)
             weight_labels: list[str] = []
             label_prices: dict[str, dict[str, float]] = defaultdict(dict)
 
@@ -479,7 +571,7 @@ def build_cost_groups_and_rows(
                 pricing_model="net",
                 title=transport_cost_title(cost_key),
                 pricing_label=pricing_label,
-                value_header=value_header_for_group(weight_labels),
+                value_header=value_header_for_group(weight_labels, cost_key),
                 currency=spec["currency"],
                 weight_labels=weight_labels,
                 prices=dict(spec["prices"]),
@@ -500,6 +592,9 @@ class FedExRatesXlsxWriter:
         self._row = 1
         self._bold = Font(bold=True)
         self._center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        self._asymmetric_fill = PatternFill(
+            fill_type="solid", fgColor="FF6B6B"
+        )
 
     def write(self) -> Workbook:
         blocks = self.data.get("rate_blocks", [])
@@ -575,7 +670,7 @@ class FedExRatesXlsxWriter:
         for cg in cost_groups:
             self.ws.cell(row=self._row, column=col, value="Currency")
             self.ws.cell(row=self._row, column=col).font = self._bold
-            value_headers = value_headers_for_labels(cg.weight_labels)
+            value_headers = value_headers_for_labels(cg.weight_labels, cg.cost_key)
             for wi, header in enumerate(value_headers):
                 cell = self.ws.cell(
                     row=self._row,
@@ -585,6 +680,8 @@ class FedExRatesXlsxWriter:
                 cell.font = self._bold
             col += cg.width
         self._row += 1
+
+        asymmetric_keys = asymmetric_zone_row_keys(rows)
 
         for row in rows:
             shipment = [
@@ -596,8 +693,13 @@ class FedExRatesXlsxWriter:
                 row.destination_postal_zone,
                 row.service,
             ]
+            highlight = row.row_key in asymmetric_keys
             for col_idx, value in enumerate(shipment, start=1):
-                self.ws.cell(row=self._row, column=col_idx, value=value or None)
+                cell = self.ws.cell(
+                    row=self._row, column=col_idx, value=value or None
+                )
+                if highlight:
+                    cell.fill = self._asymmetric_fill
 
             col = left_cols + 1
             for cg in cost_groups:
@@ -605,8 +707,11 @@ class FedExRatesXlsxWriter:
                     cg.price_for(row.row_key, weight) for weight in cg.weight_labels
                 ]
                 has_price = any(price is not None for price in prices)
+                currency_cell = self.ws.cell(row=self._row, column=col)
                 if has_price:
-                    self.ws.cell(row=self._row, column=col, value=row.currency)
+                    currency_cell.value = row.currency
+                if highlight:
+                    currency_cell.fill = self._asymmetric_fill
                 for wi, weight in enumerate(cg.weight_labels):
                     price = prices[wi]
                     cell = self.ws.cell(
@@ -616,6 +721,8 @@ class FedExRatesXlsxWriter:
                     )
                     if isinstance(price, float):
                         cell.number_format = "0.00"
+                    if highlight:
+                        cell.fill = self._asymmetric_fill
                 col += cg.width
             self._row += 1
 
